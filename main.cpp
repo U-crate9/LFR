@@ -1,7 +1,7 @@
 // ===== VelocityX LFR: one file, two modes =====
 // BLINK_TEST 1 -> only blinks the onboard LED (use this FIRST to prove flashing works)
 // BLINK_TEST 0 -> full line-follower firmware
-#define BLINK_TEST 1
+#define BLINK_TEST 0
 
 #if BLINK_TEST
 #include <Arduino.h>
