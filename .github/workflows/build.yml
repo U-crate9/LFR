@@ -1,0 +1,29 @@
+name: build-firmware
+on:
+  push:
+    paths:
+      - 'src/**'
+      - 'platformio.ini'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install platformio
+      - run: pio run
+      - name: Commit firmware.bin back to the repo
+        run: |
+          mkdir -p bin
+          cp .pio/build/blackpill_f411ce/firmware.bin bin/firmware.bin
+          git config user.name "build-bot"
+          git config user.email "build-bot@users.noreply.github.com"
+          git add bin/firmware.bin
+          git commit -m "build: firmware.bin" || echo "no change"
+          git push
