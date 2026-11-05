@@ -5,11 +5,11 @@
 // ---------------- Pins ----------------
 // Dual H-bridge with 2 inputs per motor (MX1508 / DRV8833 / L9110S). PWM goes straight to the inputs.
 // Left motor : IN1 = PB6 (TIM4_CH1), IN2 = PB7 (TIM4_CH2)
-// Right motor: IN1 = PB8 (TIM4_CH3), IN2 = PB9 (TIM4_CH4)
+// Right motor: IN1 = PB8 (TIM4_CH3), IN2 = PB1 (TIM3_CH4)   <-- moved from PB9 (PB9 kept driving the motor at rest)
 #define L_IN1_PIN PB6
 #define L_IN2_PIN PB7
 #define R_IN1_PIN PB8
-#define R_IN2_PIN PB9
+#define R_IN2_PIN PB1
 #define STBY_PIN PB5   // driven HIGH (use for DRV8833 nSLEEP if you want; harmless if unconnected)
 #define LED_PIN PC13   // active LOW
 const uint32_t sensorPin[8] = {PA1, PA2, PA3, PA4, PA5, PA6, PA7, PB0};
@@ -26,7 +26,8 @@ int baseSpeed = 900, maxSpeed = 2200;
 bool lineIsLow = true;
 bool tel = false;
 bool running = false;
-HardwareTimer *pwmTim;
+HardwareTimer *pwmTim;    // TIM4: PB6, PB7, PB8
+HardwareTimer *pwmTim3;   // TIM3: PB1 (right motor IN2)
 uint16_t mn[8], mx[8];
 float lastErr = 0;
 uint32_t lastSeen = 0, manualUntil = 0;
@@ -37,16 +38,16 @@ uint32_t lastStopAt = 0;
 
 bool invL = false, invR = false;
 // spd > 0: IN1 PWM, IN2 low.  spd < 0: IN2 PWM, IN1 low.  spd = 0: both low (coast)
-void motorPair(uint32_t chFwd, uint32_t chRev, int spd, bool inv) {
+void motorPair(HardwareTimer *t1, uint32_t ch1, HardwareTimer *t2, uint32_t ch2, int spd, bool inv) {
   spd = constrain(spd, -PWM_MAX, PWM_MAX);
   if (inv) spd = -spd;
   uint32_t a = spd > 0 ? spd : 0;
   uint32_t b = spd < 0 ? -spd : 0;
-  pwmTim->setCaptureCompare(chFwd, a, RESOLUTION_12B_COMPARE_FORMAT);
-  pwmTim->setCaptureCompare(chRev, b, RESOLUTION_12B_COMPARE_FORMAT);
+  t1->setCaptureCompare(ch1, a, RESOLUTION_12B_COMPARE_FORMAT);
+  t2->setCaptureCompare(ch2, b, RESOLUTION_12B_COMPARE_FORMAT);
 }
-void motorL(int spd) { motorPair(1, 2, spd, invL); }
-void motorR(int spd) { motorPair(3, 4, spd, invR); }
+void motorL(int spd) { motorPair(pwmTim, 1, pwmTim, 2, spd, invL); }
+void motorR(int spd) { motorPair(pwmTim, 3, pwmTim3, 4, spd, invR); }
 void stopMotors() {
   curL = curR = 0;
   motorL(0);
@@ -178,6 +179,9 @@ void handleCmd(String s) {
 void setup() {
   rstFlags = RCC->CSR;
   RCC->CSR |= RCC_CSR_RMVF;
+  // Hold all four motor inputs LOW as early as possible (PWM setup below takes over the pins)
+  const uint32_t mPins[4] = {L_IN1_PIN, L_IN2_PIN, R_IN1_PIN, R_IN2_PIN};
+  for (int i = 0; i < 4; i++) { pinMode(mPins[i], OUTPUT); digitalWrite(mPins[i], LOW); }
   pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, HIGH);
   pinMode(STBY_PIN, OUTPUT); digitalWrite(STBY_PIN, HIGH);
   analogReadResolution(12);
@@ -186,12 +190,13 @@ void setup() {
   pwmTim->setPWM(1, L_IN1_PIN, PWM_FREQ, 0);
   pwmTim->setPWM(2, L_IN2_PIN, PWM_FREQ, 0);
   pwmTim->setPWM(3, R_IN1_PIN, PWM_FREQ, 0);
-  pwmTim->setPWM(4, R_IN2_PIN, PWM_FREQ, 0);
+  pwmTim3 = new HardwareTimer(TIM3);
+  pwmTim3->setPWM(4, R_IN2_PIN, PWM_FREQ, 0);
   stopMotors();
   bt.begin(9600);
   for (int i = 0; i < 6; i++) { digitalWrite(LED_PIN, i & 1); delay(100); }
   digitalWrite(LED_PIN, HIGH);
-  bt.println("BOOT diag v2 (2-input driver) (no auto-calibrate; send cal yourself)");
+  bt.println("BOOT diag v3 (2-input driver, R_IN2=PB1) (no auto-calibrate; send cal yourself)");
   printReset();
   bt.println("Send: test   (spins each motor, no sensors needed)");
 }
