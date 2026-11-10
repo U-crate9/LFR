@@ -1,16 +1,22 @@
-// VelocityX LFR - DIAGNOSTIC firmware (v3 base + self-test + reasons for every stop/reset)
-// Board: Black Pill STM32F411CE, core STM32duino. UNTESTED on hardware: wheels in the air first!
+// VelocityX LFR - v4 (v3 diagnostic base + follow/go modes)
+// Board: Black Pill STM32F411CE, core STM32duino. Wheels in the air first!
+//
+// NEW COMMANDS
+//   follow / follow line          line follow at baseSpeed   (needs "cal" first)
+//   follow max / follow line max  line follow at maxSpeed
+//   follow 1/2 / follow line 1/2  line follow at half of maxSpeed
+//   go                            straight, NO sensors, at baseSpeed (until "stop")
+//   go max                        straight at maxSpeed
+//   go 1/2                        straight at half of maxSpeed
+//   (also works: follow 70 = 70% of maxSpeed, go 30 = 30% of maxSpeed, 1/4, 3/4)
 #include <Arduino.h>
 
 // ---------------- Pins ----------------
-// Dual H-bridge with 2 inputs per motor (MX1508 / DRV8833 / L9110S). PWM goes straight to the inputs.
-// Left motor : IN1 = PB6 (TIM4_CH1), IN2 = PB7 (TIM4_CH2)
-// Right motor: IN1 = PB8 (TIM4_CH3), IN2 = PB1 (TIM3_CH4)   <-- moved from PB9 (PB9 kept driving the motor at rest)
 #define L_IN1_PIN PB6
 #define L_IN2_PIN PB7
 #define R_IN1_PIN PB8
 #define R_IN2_PIN PB1
-#define STBY_PIN PB5   // driven HIGH (use for DRV8833 nSLEEP if you want; harmless if unconnected)
+#define STBY_PIN PB5
 #define LED_PIN PC13   // active LOW
 const uint32_t sensorPin[8] = {PA1, PA2, PA3, PA4, PA5, PA6, PA7, PB0};
 HardwareSerial bt(PA10, PA9);  // RX=PA10 (<-HC-05 TXD), TX=PA9 (->HC-05 RXD)
@@ -19,15 +25,21 @@ HardwareSerial bt(PA10, PA9);  // RX=PA10 (<-HC-05 TXD), TX=PA9 (->HC-05 RXD)
 #define PWM_MAX 4095
 #define SLEW_PER_MS 6
 #define LOST_TIMEOUT_MS 300
+#define MIN_SPAN 120      // sensor with smaller (max-min) after cal is ignored (low-contrast setup)
+
+enum Mode { M_IDLE, M_FOLLOW, M_STRAIGHT, M_MANUAL };
 
 // ---------------- State ----------------
 float Kp = 0.15f, Kd = 1.8f;
 int baseSpeed = 900, maxSpeed = 2200;
-bool lineIsLow = true;
+bool lineIsLow = false;   // your dump: black line gives HIGHER value -> false
 bool tel = false;
-bool running = false;
+Mode mode = M_IDLE;
+int goSpeed = 0, followSpeed = 900, manL = 0, manR = 0;
+bool calibrated = false;
+bool ok[8] = {true, true, true, true, true, true, true, true};
 HardwareTimer *pwmTim;    // TIM4: PB6, PB7, PB8
-HardwareTimer *pwmTim3;   // TIM3: PB1 (right motor IN2)
+HardwareTimer *pwmTim3;   // TIM3: PB1
 uint16_t mn[8], mx[8];
 float lastErr = 0;
 uint32_t lastSeen = 0, manualUntil = 0;
@@ -37,7 +49,6 @@ String lastStop = "none";
 uint32_t lastStopAt = 0;
 
 bool invL = false, invR = false;
-// spd > 0: IN1 PWM, IN2 low.  spd < 0: IN2 PWM, IN1 low.  spd = 0: both low (coast)
 void motorPair(HardwareTimer *t1, uint32_t ch1, HardwareTimer *t2, uint32_t ch2, int spd, bool inv) {
   spd = constrain(spd, -PWM_MAX, PWM_MAX);
   if (inv) spd = -spd;
@@ -48,27 +59,37 @@ void motorPair(HardwareTimer *t1, uint32_t ch1, HardwareTimer *t2, uint32_t ch2,
 }
 void motorL(int spd) { motorPair(pwmTim, 1, pwmTim, 2, spd, invL); }
 void motorR(int spd) { motorPair(pwmTim, 3, pwmTim3, 4, spd, invR); }
-void stopMotors() {
-  curL = curR = 0;
-  motorL(0);
-  motorR(0);
-}
+void stopMotors() { curL = curR = 0; motorL(0); motorR(0); }
 int pct2pwm(int pct) { return constrain(pct, -100, 100) * PWM_MAX / 100; }
 int slew(int cur, int target) {
   if (target > cur + SLEW_PER_MS) return cur + SLEW_PER_MS;
   if (target < cur - SLEW_PER_MS) return cur - SLEW_PER_MS;
   return target;
 }
-void drive(int l, int r) {
-  l = constrain(l, -maxSpeed, maxSpeed); r = constrain(r, -maxSpeed, maxSpeed);
-  curL = slew(curL, l); curR = slew(curR, r);
-  motorL(curL);
-  motorR(curR);
-}
 void stopWhy(const char *why) {
-  running = false; manualUntil = 0; stopMotors();
+  mode = M_IDLE; manualUntil = 0; stopMotors();
   lastStop = why; lastStopAt = millis();
+  digitalWrite(LED_PIN, HIGH);
   bt.print("STOP: "); bt.println(why);
+}
+
+// "max" -> maxSpeed, "1/2" or "half" -> maxSpeed/2, "1/4", "3/4", number = % of maxSpeed, empty -> def
+int parseSpeed(String a, int def) {
+  a.trim();
+  if (a.length() == 0) return def;
+  if (a == "max") return maxSpeed;
+  if (a == "1/2" || a == "half") return maxSpeed / 2;
+  if (a == "1/4") return maxSpeed / 4;
+  if (a == "3/4") return maxSpeed * 3 / 4;
+  int n = constrain(a.toInt(), 0, 100);
+  return maxSpeed * n / 100;
+}
+
+// average of 4 reads to reduce ADC noise (important while contrast is low)
+uint16_t readSensor(int i) {
+  uint32_t s = 0;
+  for (int k = 0; k < 4; k++) s += analogRead(sensorPin[i]);
+  return s / 4;
 }
 
 void calibrate() {
@@ -77,18 +98,29 @@ void calibrate() {
   while (millis() - t0 < 4000) {
     digitalWrite(LED_PIN, (millis() / 80) & 1);
     for (int i = 0; i < 8; i++) {
-      uint16_t v = analogRead(sensorPin[i]);
+      uint16_t v = readSensor(i);
       if (v < mn[i]) mn[i] = v;
       if (v > mx[i]) mx[i] = v;
     }
   }
   digitalWrite(LED_PIN, HIGH);
+  int good = 0;
+  for (int i = 0; i < 8; i++) {
+    int span = (int)mx[i] - (int)mn[i];
+    ok[i] = span >= MIN_SPAN;
+    if (ok[i]) good++;
+    bt.print("S"); bt.print(i); bt.print(" min="); bt.print(mn[i]);
+    bt.print(" max="); bt.print(mx[i]); bt.println(ok[i] ? " OK" : " IGNORED (too small change)");
+  }
+  calibrated = good >= 2;
+  if (!calibrated) bt.println("CAL FAILED: sensors barely change. Lower the sensor board (3-8 mm from floor) / turn the sensor pot, then cal again.");
 }
 
 float readLine(bool &seen, int &nOn) {
   long num = 0, den = 0; nOn = 0;
   for (int i = 0; i < 8; i++) {
-    int raw = analogRead(sensorPin[i]);
+    if (!ok[i]) continue;
+    int raw = readSensor(i);
     int span = max(60, (int)mx[i] - (int)mn[i]);
     long v = constrain(((long)raw - mn[i]) * 1000L / span, 0L, 1000L);
     if (lineIsLow) v = 1000 - v;
@@ -113,7 +145,8 @@ void printReset() {
 void printStatus() {
   bt.print("uptime_s="); bt.println(millis() / 1000);
   printReset();
-  bt.print("running="); bt.print(running); bt.print(" base="); bt.print(baseSpeed);
+  bt.print("mode="); bt.print((int)mode); bt.print(" (0 idle,1 follow,2 go,3 manual) calibrated="); bt.println(calibrated);
+  bt.print("base="); bt.print(baseSpeed);
   bt.print(" max="); bt.print(maxSpeed); bt.print(" lineIsLow="); bt.println(lineIsLow);
   bt.print("kp="); bt.print(Kp); bt.print(" kd="); bt.println(Kd);
   bt.print("last stop: "); bt.print(lastStop);
@@ -125,18 +158,17 @@ void printDump() {
   bt.println();
 }
 
+// manual test: ramps up smoothly (slew) to avoid battery sag / brown-out reset
 void runManual(const char *name, int pctL, int pctR, uint32_t ms) {
-  running = false;
   bt.print("RUN "); bt.print(name); bt.print(" L="); bt.print(pctL); bt.print("% R="); bt.print(pctR);
   bt.print("% for "); bt.print(ms); bt.println(" ms");
-  motorL(pct2pwm(pctL));
-  motorR(pct2pwm(pctR));
-  curL = pct2pwm(pctL); curR = pct2pwm(pctR);
+  manL = pct2pwm(pctL); manR = pct2pwm(pctR);
+  mode = M_MANUAL;
   manualUntil = millis() + ms;
 }
 
 void selfTest() {
-  running = false;
+  mode = M_IDLE; stopMotors();
   bt.println("TEST start: 4 steps, 1 s each, 60%. Watch the wheels.");
   const char *nm[4] = {"left fwd", "left back", "right fwd", "right back"};
   int l[4] = {60, -60, 0, 0}, r[4] = {0, 0, 60, -60};
@@ -153,12 +185,21 @@ void selfTest() {
 
 void handleCmd(String s) {
   s.trim(); s.toLowerCase();
-  if (s == "go") {
-    running = true; manualUntil = 0; lastSeen = millis();
-    bt.println("GO (sensor mode: stops by itself if line lost 300 ms)");
+  if (s.startsWith("follow")) {
+    String a = s.substring(6);
+    a.replace("line", "");
+    followSpeed = parseSpeed(a, baseSpeed);
+    if (!calibrated) { bt.println("Do 'cal' first (slide sensors over line + floor for 4 s)"); return; }
+    lastErr = 0; lastSeen = millis(); manualUntil = 0; mode = M_FOLLOW;
+    bt.print("FOLLOW speed="); bt.print(followSpeed); bt.println(" (stops if line lost 300 ms)");
+  }
+  else if (s == "go" || s.startsWith("go ")) {
+    goSpeed = parseSpeed(s.substring(2), baseSpeed);
+    manualUntil = 0; mode = M_STRAIGHT;
+    bt.print("GO straight speed="); bt.print(goSpeed); bt.println(" (no sensors, send 'stop' to stop)");
   }
   else if (s == "stop") { stopWhy("command"); }
-  else if (s == "cal") { stopMotors(); running = false; bt.println("CAL 4 s: slide over line"); calibrate(); bt.println("CAL done"); }
+  else if (s == "cal") { mode = M_IDLE; stopMotors(); bt.println("CAL 4 s: slide over line and floor"); calibrate(); bt.println("CAL done"); }
   else if (s == "dump") { printDump(); }
   else if (s == "status" || s == "show") { printStatus(); }
   else if (s == "test") { selfTest(); }
@@ -168,18 +209,17 @@ void handleCmd(String s) {
   else if (s.startsWith("kp ")) { Kp = s.substring(3).toFloat(); bt.print("Kp="); bt.println(Kp); }
   else if (s.startsWith("kd ")) { Kd = s.substring(3).toFloat(); bt.print("Kd="); bt.println(Kd); }
   else if (s.startsWith("base ")) { baseSpeed = s.substring(5).toInt(); bt.print("base="); bt.println(baseSpeed); }
-  else if (s.startsWith("max ")) { maxSpeed = s.substring(4).toInt(); bt.print("max="); bt.println(maxSpeed); }
+  else if (s.startsWith("max ")) { maxSpeed = constrain(s.substring(4).toInt(), 0, PWM_MAX); bt.print("max="); bt.println(maxSpeed); }
   else if (s.startsWith("invl ")) { invL = s.substring(5).toInt() != 0; bt.print("invL="); bt.println(invL); }
   else if (s.startsWith("invr ")) { invR = s.substring(5).toInt() != 0; bt.print("invR="); bt.println(invR); }
   else if (s.startsWith("pol ")) { lineIsLow = s.substring(4).toInt() != 0; bt.print("lineIsLow="); bt.println(lineIsLow); }
   else if (s.startsWith("tel ")) { tel = s.substring(4).toInt() != 0; bt.print("tel="); bt.println(tel); }
-  else bt.println("cmds: test | ml n | mr n | fwd n (n=-100..100, 3 s) | status | dump | cal | go | stop | base n | max n | kp x | kd x | pol 0/1 | invl 0/1 | invr 0/1 | tel 0/1");
+  else bt.println("cmds: follow [line] [max|1/2|%] | go [max|1/2|%] | stop | cal | dump | status | test | fwd n | ml n | mr n | base n | max n | kp x | kd x | pol 0/1 | invl 0/1 | invr 0/1 | tel 0/1");
 }
 
 void setup() {
   rstFlags = RCC->CSR;
   RCC->CSR |= RCC_CSR_RMVF;
-  // Hold all four motor inputs LOW as early as possible (PWM setup below takes over the pins)
   const uint32_t mPins[4] = {L_IN1_PIN, L_IN2_PIN, R_IN1_PIN, R_IN2_PIN};
   for (int i = 0; i < 4; i++) { pinMode(mPins[i], OUTPUT); digitalWrite(mPins[i], LOW); }
   pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, HIGH);
@@ -196,9 +236,9 @@ void setup() {
   bt.begin(9600);
   for (int i = 0; i < 6; i++) { digitalWrite(LED_PIN, i & 1); delay(100); }
   digitalWrite(LED_PIN, HIGH);
-  bt.println("BOOT diag v3 (2-input driver, R_IN2=PB1) (no auto-calibrate; send cal yourself)");
+  bt.println("BOOT v4 (follow / go modes)");
   printReset();
-  bt.println("Send: test   (spins each motor, no sensors needed)");
+  bt.println("Send: cal, then follow | follow max | follow 1/2 | go | go max | go 1/2 | stop");
 }
 
 void loop() {
@@ -212,19 +252,31 @@ void loop() {
   if (manualUntil && millis() > manualUntil) { stopWhy("manual timeout (3 s)"); }
   if (micros() < tNext) return;
   tNext = micros() + 1000;
-  if (!running) return;
-  digitalWrite(LED_PIN, LOW);
-  bool seen; int nOn;
-  float err = readLine(seen, nOn);
-  if (seen) lastSeen = millis();
-  else if (millis() - lastSeen > LOST_TIMEOUT_MS) { digitalWrite(LED_PIN, HIGH); stopWhy("line lost (no sensor sees the line)"); return; }
-  float corr = Kp * err + Kd * (err - lastErr);
-  lastErr = err;
-  drive(baseSpeed + (int)corr, baseSpeed - (int)corr);
-  if (tel && millis() - tTel > 500) {
+  if (mode == M_IDLE) return;
+
+  int tL = 0, tR = 0;
+  float err = 0; int nOn = 0;
+  if (mode == M_FOLLOW) {
+    digitalWrite(LED_PIN, LOW);
+    bool seen;
+    err = readLine(seen, nOn);
+    if (seen) lastSeen = millis();
+    else if (millis() - lastSeen > LOST_TIMEOUT_MS) { stopWhy("line lost (no sensor sees the line)"); return; }
+    float corr = Kp * err + Kd * (err - lastErr);
+    lastErr = err;
+    tL = constrain(followSpeed + (int)corr, -maxSpeed, maxSpeed);
+    tR = constrain(followSpeed - (int)corr, -maxSpeed, maxSpeed);
+  } else if (mode == M_STRAIGHT) {
+    tL = tR = goSpeed;
+  } else if (mode == M_MANUAL) {
+    tL = manL; tR = manR;
+  }
+  curL = slew(curL, tL); curR = slew(curR, tR);
+  motorL(curL); motorR(curR);
+
+  if (tel && mode == M_FOLLOW && millis() - tTel > 500) {
     tTel = millis();
     bt.print("run err="); bt.print((int)err); bt.print(" on="); bt.print(nOn);
     bt.print(" L="); bt.print(curL); bt.print(" R="); bt.println(curR);
   }
 }
-// rebuild
